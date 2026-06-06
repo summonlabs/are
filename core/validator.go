@@ -22,7 +22,16 @@ func ValidateAirWithErrors(artifact AuthorityArtifact) error {
 		return nil
 	}
 
+	seenClaimIDs := make(map[string]bool)
 	for _, claim := range artifact.Claims {
+		if seenClaimIDs[claim.ID] {
+			return &ValidationError{
+				Field:   "claim.ID",
+				Message: fmt.Sprintf("duplicate claim ID: %s", claim.ID),
+				Err:     ErrInvalidClaim,
+			}
+		}
+		seenClaimIDs[claim.ID] = true
 		if err := validateClaimWithErrors(claim, artifact.Graph); err != nil {
 			return err
 		}
@@ -61,6 +70,12 @@ func validateClaim(claim Claim, graph AuthorityGraph) bool {
 	if claim.SourceID == "" {
 		return false
 	}
+	if !IsValidClaimType(claim.Type) {
+		return false
+	}
+	if !ValidateScope(claim.Scope) {
+		return false
+	}
 
 	// Validate delegation claims
 	if claim.Type == Delegation {
@@ -93,48 +108,52 @@ func validateDelegationClaim(claim Claim, graph AuthorityGraph) bool {
 }
 
 func isScopeContained(inner Scope, outer Scope) bool {
-	// Jurisdictions must be subset
-	innerSet := make(map[string]bool)
-	for _, j := range inner.Jurisdictions {
-		innerSet[j] = true
-	}
-	outerSet := make(map[string]bool)
-	for _, j := range outer.Jurisdictions {
-		outerSet[j] = true
-	}
-	for j := range innerSet {
-		if !outerSet[j] {
-			return false
-		}
+	if !isStringSetContained(inner.Jurisdictions, outer.Jurisdictions) {
+		return false
 	}
 
-	// Operations must be subset
-	innerOpSet := make(map[string]bool)
-	for _, o := range inner.Operations {
-		innerOpSet[o] = true
-	}
-	outerOpSet := make(map[string]bool)
-	for _, o := range outer.Operations {
-		outerOpSet[o] = true
-	}
-	for o := range innerOpSet {
-		if !outerOpSet[o] {
-			return false
-		}
+	if !isStringSetContained(inner.Operations, outer.Operations) {
+		return false
 	}
 
 	// Time bounds must be within outer bounds
-	if outer.TimeStart != nil && inner.TimeStart != nil {
+	if outer.TimeStart != nil {
+		if inner.TimeStart == nil {
+			return false
+		}
 		if inner.TimeStart.Before(*outer.TimeStart) {
 			return false
 		}
 	}
-	if outer.TimeEnd != nil && inner.TimeEnd != nil {
+	if outer.TimeEnd != nil {
+		if inner.TimeEnd == nil {
+			return false
+		}
 		if inner.TimeEnd.After(*outer.TimeEnd) {
 			return false
 		}
 	}
 
+	return true
+}
+
+func isStringSetContained(inner []string, outer []string) bool {
+	if len(outer) == 0 {
+		return true
+	}
+	if len(inner) == 0 {
+		return false
+	}
+
+	outerSet := make(map[string]bool)
+	for _, value := range outer {
+		outerSet[value] = true
+	}
+	for _, value := range inner {
+		if !outerSet[value] {
+			return false
+		}
+	}
 	return true
 }
 
@@ -162,6 +181,9 @@ func validateGraph(graph AuthorityGraph) bool {
 			return false
 		}
 		if edge.EdgeType == "" {
+			return false
+		}
+		if !IsValidEdgeType(edge.EdgeType) {
 			return false
 		}
 	}
@@ -204,6 +226,12 @@ func validateGraphWithErrors(graph AuthorityGraph) error {
 			return &ValidationError{
 				Field:   "edge.EdgeType",
 				Message: "edge type is required",
+			}
+		}
+		if !IsValidEdgeType(edge.EdgeType) {
+			return &ValidationError{
+				Field:   "edge.EdgeType",
+				Message: fmt.Sprintf("invalid edge type: %s", edge.EdgeType),
 			}
 		}
 	}

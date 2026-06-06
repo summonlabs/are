@@ -79,7 +79,6 @@ func TestValidateAirWithNoneGraph(t *testing.T) {
 	}
 }
 
-
 func TestValidateAirWithErrors(t *testing.T) {
 	// Test empty artifact with initialized graph (should pass)
 	emptyArtifact := core.AuthorityArtifact{
@@ -103,6 +102,73 @@ func TestValidateAirWithErrors(t *testing.T) {
 	}
 	if err := core.ValidateAirWithErrors(nilGraphArtifact); err == nil {
 		t.Error("Artifact with nil graph nodes should fail validation")
+	}
+}
+
+func TestValidateAirRejectsDuplicateClaimIDs(t *testing.T) {
+	claim := core.Claim{
+		ID:       "claim_1",
+		Type:     core.Permission,
+		Subject:  "user_1",
+		Action:   "read",
+		Resource: "/data/file.txt",
+		SourceID: "source_1",
+	}
+	artifact := core.AuthorityArtifact{
+		ID:          "duplicate_claims",
+		SourceID:    "source_1",
+		Claims:      []core.Claim{claim, claim},
+		Graph:       core.AuthorityGraph{Nodes: make(map[string]core.Claim), Edges: []core.Edge{}},
+		GeneratedAt: time.Now().UTC(),
+	}
+
+	if err := core.ValidateAirWithErrors(artifact); err == nil {
+		t.Fatal("duplicate claim IDs should fail validation")
+	}
+}
+
+func TestValidateAirRejectsInvalidClaimType(t *testing.T) {
+	claim := core.Claim{
+		ID:       "claim_1",
+		Type:     core.ClaimType("invalid"),
+		Subject:  "user_1",
+		Action:   "read",
+		Resource: "/data/file.txt",
+		SourceID: "source_1",
+	}
+	artifact := core.AuthorityArtifact{
+		ID:          "invalid_claim_type",
+		SourceID:    "source_1",
+		Claims:      []core.Claim{claim},
+		Graph:       core.AuthorityGraph{Nodes: make(map[string]core.Claim), Edges: []core.Edge{}},
+		GeneratedAt: time.Now().UTC(),
+	}
+
+	if err := core.ValidateAirWithErrors(artifact); err == nil {
+		t.Fatal("invalid claim type should fail validation")
+	}
+}
+
+func TestValidateAirRejectsInvalidEdgeType(t *testing.T) {
+	graph := core.AuthorityGraph{
+		Nodes: map[string]core.Claim{
+			"a": {ID: "a", Type: core.Permission, Subject: "u", Action: "r", Resource: "/", SourceID: "s"},
+			"b": {ID: "b", Type: core.Permission, Subject: "u", Action: "r", Resource: "/", SourceID: "s"},
+		},
+		Edges: []core.Edge{
+			{FromID: "a", ToID: "b", EdgeType: core.EdgeType("invalid")},
+		},
+	}
+	artifact := core.AuthorityArtifact{
+		ID:          "invalid_edge_type",
+		SourceID:    "source",
+		Claims:      []core.Claim{graph.Nodes["a"], graph.Nodes["b"]},
+		Graph:       graph,
+		GeneratedAt: time.Now().UTC(),
+	}
+
+	if err := core.ValidateAirWithErrors(artifact); err == nil {
+		t.Fatal("invalid edge type should fail validation")
 	}
 }
 

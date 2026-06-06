@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"strconv"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -58,8 +58,8 @@ func (c *AuthorityCompiler) SetLogger(logger Logger) {
 // Ingest ingests an authority source and normalizes it to AIR.
 // Returns an error if the source is invalid.
 func (c *AuthorityCompiler) Ingest(source AuthoritySource) (AuthorityArtifact, error) {
-	if source.ID == "" {
-		return AuthorityArtifact{}, ErrEmptySourceID
+	if err := validateAuthoritySource(source); err != nil {
+		return AuthorityArtifact{}, err
 	}
 
 	artifact := AuthorityArtifact{
@@ -81,6 +81,9 @@ func (c *AuthorityCompiler) Normalize(ctx context.Context, source AuthoritySourc
 
 	if source.ID == "" {
 		return AuthorityArtifact{}, ErrEmptySourceID
+	}
+	if err := validateAuthoritySource(source); err != nil {
+		return AuthorityArtifact{}, err
 	}
 
 	// Store source for later precedence resolution (thread-safe)
@@ -137,32 +140,9 @@ func (c *AuthorityCompiler) parseClaim(claimDict map[string]interface{}, sourceI
 	}
 
 	scopeData, _ := claimDict["scope"].(map[string]interface{})
-	jurisdictions := []string{}
-	if j, ok := scopeData["jurisdictions"].([]interface{}); ok {
-		for _, v := range j {
-			if s, ok := v.(string); ok {
-				jurisdictions = append(jurisdictions, s)
-			}
-		}
-	}
-
-	timeStart := parseTime(scopeData["time_start"])
-	timeEnd := parseTime(scopeData["time_end"])
-
-	operations := []string{}
-	if o, ok := scopeData["operations"].([]interface{}); ok {
-		for _, v := range o {
-			if s, ok := v.(string); ok {
-				operations = append(operations, s)
-			}
-		}
-	}
-
-	scope := Scope{
-		Jurisdictions: jurisdictions,
-		TimeStart:     timeStart,
-		TimeEnd:       timeEnd,
-		Operations:    operations,
+	scope, err := parseScope(scopeData)
+	if err != nil {
+		return Claim{}, err
 	}
 
 	subject, _ := claimDict["subject"].(string)
@@ -358,7 +338,17 @@ func (c *AuthorityCompiler) applyPrecedence(claims []Claim, artifact AuthorityAr
 	}
 	c.mu.RUnlock()
 
-	sort.Slice(claims, func(i, j int) bool {
+	for _, claim := range claims {
+		source, exists := sourcesCopy[claim.SourceID]
+		if !exists {
+			return nil, newValidationError("source_id", fmt.Sprintf("unknown source for claim %s: %s", claim.ID, claim.SourceID), nil)
+		}
+		if !IsValidAuthorityType(source.Type) {
+			return nil, newValidationError("source.type", fmt.Sprintf("invalid authority type for source %s: %s", source.ID, source.Type), nil)
+		}
+	}
+
+	sort.SliceStable(claims, func(i, j int) bool {
 		claimA := claims[i]
 		claimB := claims[j]
 
@@ -368,8 +358,28 @@ func (c *AuthorityCompiler) applyPrecedence(claims []Claim, artifact AuthorityAr
 		keyA := precedenceKey(sourceA, claimA, authorityOrder, artifact.Graph)
 		keyB := precedenceKey(sourceB, claimB, authorityOrder, artifact.Graph)
 
-		return comparePrecedenceKeys(keyA, keyB) < 0
+		if cmp := comparePrecedenceKeys(keyA, keyB); cmp != 0 {
+			return cmp < 0
+		}
+		return claimA.ID < claimB.ID
 	})
+
+	topKey := precedenceKey(sourcesCopy[claims[0].SourceID], claims[0], authorityOrder, artifact.Graph)
+	samePrecedence := []Claim{}
+	for _, claim := range claims {
+		key := precedenceKey(sourcesCopy[claim.SourceID], claim, authorityOrder, artifact.Graph)
+		if comparePrecedenceKeys(topKey, key) != 0 {
+			break
+		}
+		samePrecedence = append(samePrecedence, claim)
+	}
+
+	for _, claim := range samePrecedence {
+		if claim.Type == Prohibition {
+			winner := claim
+			return &winner, nil
+		}
+	}
 
 	return &claims[0], nil
 }
@@ -485,10 +495,10 @@ func (c *AuthorityCompiler) ProcessWithContext(ctx context.Context, source Autho
 	if err := c.Validate(artifact); err != nil {
 		c.logger.Error("Validation failed: %v", err)
 		return CompilationFailure{
-			FailureStage:     "validation",
+			FailureStage:      "validation",
 			ViolatedInvariant: err.Error(),
 			InvolvedClaimIDs:  getClaimIDs(artifact.Claims),
-			FailClosed:       true,
+			FailClosed:        true,
 		}
 	}
 	c.logger.Info("Validation passed")
@@ -539,6 +549,88 @@ func parseTime(t interface{}) *time.Time {
 	return nil
 }
 
+func validateAuthoritySource(source AuthoritySource) error {
+	if source.ID == "" {
+		return ErrEmptySourceID
+	}
+	if !IsValidAuthorityType(source.Type) {
+		return newValidationError("type", fmt.Sprintf("invalid authority type: %s", source.Type), nil)
+	}
+	if source.Version != "" && semverRegex.FindStringSubmatch(source.Version) == nil {
+		return newValidationError("version", fmt.Sprintf("invalid version: %s", source.Version), ErrInvalidVersion)
+	}
+	return nil
+}
+
+func parseScope(scopeData map[string]interface{}) (Scope, error) {
+	jurisdictions, err := parseStringSlice(scopeData["jurisdictions"], "scope.jurisdictions")
+	if err != nil {
+		return Scope{}, err
+	}
+	operations, err := parseStringSlice(scopeData["operations"], "scope.operations")
+	if err != nil {
+		return Scope{}, err
+	}
+	timeStart, err := parseTimeField(scopeData["time_start"], "scope.time_start")
+	if err != nil {
+		return Scope{}, err
+	}
+	timeEnd, err := parseTimeField(scopeData["time_end"], "scope.time_end")
+	if err != nil {
+		return Scope{}, err
+	}
+
+	scope := Scope{
+		Jurisdictions: jurisdictions,
+		TimeStart:     timeStart,
+		TimeEnd:       timeEnd,
+		Operations:    operations,
+	}
+	if err := ValidateScopeWithErrors(scope); err != nil {
+		return Scope{}, err
+	}
+	return scope, nil
+}
+
+func parseStringSlice(value interface{}, field string) ([]string, error) {
+	if value == nil {
+		return []string{}, nil
+	}
+	switch values := value.(type) {
+	case []string:
+		result := make([]string, len(values))
+		copy(result, values)
+		return result, nil
+	case []interface{}:
+		result := make([]string, 0, len(values))
+		for _, item := range values {
+			s, ok := item.(string)
+			if !ok {
+				return nil, newValidationError(field, "must contain only strings", nil)
+			}
+			result = append(result, s)
+		}
+		return result, nil
+	default:
+		return nil, newValidationError(field, "must be a string slice", nil)
+	}
+}
+
+func parseTimeField(value interface{}, field string) (*time.Time, error) {
+	if value == nil {
+		return nil, nil
+	}
+	s, ok := value.(string)
+	if !ok || s == "" {
+		return nil, newValidationError(field, "must be an RFC3339 timestamp string", ErrInvalidScope)
+	}
+	parsed, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return nil, newValidationError(field, "must be an RFC3339 timestamp string", err)
+	}
+	return &parsed, nil
+}
+
 func convertMapInterface(m interface{}) map[string]interface{} {
 	if m == nil {
 		return nil
@@ -556,12 +648,13 @@ func generateUUID() string {
 func precedenceKey(source AuthoritySource, claim Claim, authorityOrder map[AuthorityType]int, graph AuthorityGraph) []interface{} {
 	order := authorityOrder[source.Type]
 	version := parseVersion(source.Version)
+	versionKey := []int{-version[0], -version[1], -version[2]}
 	depth := getDelegationDepth(claim, graph)
 	specificity := getScopeSpecificity(claim.Scope)
 
 	return []interface{}{
 		order,
-		version,
+		versionKey,
 		depth,
 		-specificity,
 	}
@@ -591,6 +684,23 @@ func comparePrecedenceKeys(a, b []interface{}) int {
 			if av < bv {
 				return -1
 			} else if av > bv {
+				return 1
+			}
+		case []int:
+			bv, ok := b[i].([]int)
+			if !ok {
+				return 1
+			}
+			for j := 0; j < len(av) && j < len(bv); j++ {
+				if av[j] < bv[j] {
+					return -1
+				} else if av[j] > bv[j] {
+					return 1
+				}
+			}
+			if len(av) < len(bv) {
+				return -1
+			} else if len(av) > len(bv) {
 				return 1
 			}
 		}
@@ -660,10 +770,10 @@ func getScopeSpecificity(scope Scope) int {
 	specificity += len(scope.Operations)
 	// Time bounds make it more specific
 	if scope.TimeStart != nil {
-		specificity -= 10
+		specificity += 10
 	}
 	if scope.TimeEnd != nil {
-		specificity -= 10
+		specificity += 10
 	}
 	return specificity
 }
