@@ -354,15 +354,16 @@ func TestRuntimeAuthorization(t *testing.T) {
 	}
 
 	runtime := core.NewRuntimeInterface(result.(core.CompilationSuccess).Artifact)
+	authContext := core.AuthorizationContext{Jurisdiction: "US"}
 
 	// Should be authorized
-	authResult := runtime.IsAuthorized("engineer", "read", "/code/main.py")
+	authResult := runtime.IsAuthorizedWithContext("engineer", "read", "/code/main.py", authContext)
 	if !authResult["allowed"].(bool) {
 		t.Error("Expected engineer to be authorized for reading /code/main.py")
 	}
 
 	// Should not be authorized (fail closed)
-	authResult = runtime.IsAuthorized("intern", "read", "/code/main.py")
+	authResult = runtime.IsAuthorizedWithContext("intern", "read", "/code/main.py", authContext)
 	if authResult["allowed"].(bool) {
 		t.Error("Expected intern to be denied authorization for reading /code/main.py")
 	}

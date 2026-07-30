@@ -25,10 +25,13 @@ func TestValidateAir(t *testing.T) {
 		SourceID:   "source_1",
 	}
 	artifact := core.AuthorityArtifact{
-		ID:          "test_artifact",
-		SourceID:    "source_1",
-		Claims:      []core.Claim{claim},
-		Graph:       core.AuthorityGraph{Nodes: make(map[string]core.Claim), Edges: []core.Edge{}},
+		ID:       "test_artifact",
+		SourceID: "source_1",
+		Claims:   []core.Claim{claim},
+		Graph: core.AuthorityGraph{
+			Nodes: map[string]core.Claim{claim.ID: claim},
+			Edges: []core.Edge{},
+		},
 		GeneratedAt: time.Now().UTC(),
 	}
 

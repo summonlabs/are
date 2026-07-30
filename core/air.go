@@ -2,7 +2,6 @@
 package core
 
 import (
-	"sync"
 	"time"
 )
 
@@ -11,11 +10,11 @@ import (
 type AuthorityType string
 
 const (
-	Sovereign     AuthorityType = "sovereign"
-	Legal         AuthorityType = "legal"
-	Regulatory    AuthorityType = "regulatory"
+	Sovereign      AuthorityType = "sovereign"
+	Legal          AuthorityType = "legal"
+	Regulatory     AuthorityType = "regulatory"
 	Organizational AuthorityType = "organizational"
-	Contractual   AuthorityType = "contractual"
+	Contractual    AuthorityType = "contractual"
 )
 
 // ClaimType represents semantic types of authority claims.
@@ -34,8 +33,8 @@ const (
 type EdgeType string
 
 const (
-	Delegates EdgeType = "delegates"
-	Revokes   EdgeType = "revokes"
+	Delegates  EdgeType = "delegates"
+	Revokes    EdgeType = "revokes"
 	Supersedes EdgeType = "supersedes"
 )
 
@@ -76,7 +75,7 @@ type AuthoritySource struct {
 
 // AuthorityGraph represents formal structure encoding precedence, inheritance, delegation, and revocation.
 // Graphs must be acyclic; cyclic graphs fail validation.
-// Thread-safe for concurrent read access when protected by parent artifact's mutex.
+// Callers that mutate a graph must provide their own synchronization.
 type AuthorityGraph struct {
 	Nodes map[string]Claim
 	Edges []Edge
@@ -95,17 +94,13 @@ type Edge struct {
 
 // AuthorityArtifact represents compiled output that binds systems to authority.
 // Artifacts are the primary output of the compilation pipeline.
-// Thread-safe for concurrent read access; use RLock/RUnlock for reads.
+// Synchronization is owned by the compiler or runtime that contains an artifact.
 type AuthorityArtifact struct {
 	ID          string         `json:"id"`
 	SourceID    string         `json:"source_id"`
 	Claims      []Claim        `json:"claims"`
 	Graph       AuthorityGraph `json:"graph"` // Always required, even if empty
 	GeneratedAt time.Time      `json:"generated_at"`
-
-	// mu protects concurrent access to artifact fields.
-	// Use RLock for reads, Lock for writes.
-	mu sync.RWMutex
 }
 
 // CompilationSuccess represents successful compilation outcome.
@@ -116,10 +111,10 @@ type CompilationSuccess struct {
 
 // CompilationFailure represents failed compilation outcome.
 type CompilationFailure struct {
-	FailureStage     string   // ingestion, validation, resolution, compilation
+	FailureStage      string // ingestion, validation, resolution, compilation
 	ViolatedInvariant string
-	InvolvedClaimIDs []string
-	FailClosed       bool
+	InvolvedClaimIDs  []string
+	FailClosed        bool
 }
 
 // AuthorityTypeOrder returns the precedence order for authority types.

@@ -1,12 +1,14 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,9 +52,18 @@ func NewAuthorityCompiler() *AuthorityCompiler {
 
 // SetLogger sets the logger for the compiler.
 func (c *AuthorityCompiler) SetLogger(logger Logger) {
+	if logger == nil {
+		logger = &DefaultLogger{}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.logger = logger
+}
+
+func (c *AuthorityCompiler) getLogger() Logger {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.logger
 }
 
 // Ingest ingests an authority source and normalizes it to AIR.
@@ -86,24 +97,26 @@ func (c *AuthorityCompiler) Normalize(ctx context.Context, source AuthoritySourc
 		return AuthorityArtifact{}, err
 	}
 
-	// Store source for later precedence resolution (thread-safe)
-	c.mu.Lock()
-	c.sources[source.ID] = source
-	c.mu.Unlock()
-
 	claims := []Claim{}
 	var parseErrors []error
 
-	if claimsData, ok := source.Metadata["claims"].([]interface{}); ok {
+	if rawClaims, exists := source.Metadata["claims"]; exists {
+		claimsData, ok := rawClaims.([]interface{})
+		if !ok {
+			return AuthorityArtifact{}, newValidationError("metadata.claims", "must be an array of claim objects", nil)
+		}
 		for _, claimData := range claimsData {
-			if claimDict, ok := claimData.(map[string]interface{}); ok {
-				claim, err := c.parseClaim(claimDict, source.ID)
-				if err != nil {
-					parseErrors = append(parseErrors, err)
-					continue
-				}
-				claims = append(claims, claim)
+			claimDict, ok := claimData.(map[string]interface{})
+			if !ok {
+				parseErrors = append(parseErrors, newValidationError("metadata.claims", "each claim must be an object", nil))
+				continue
 			}
+			claim, err := c.parseClaim(claimDict, source.ID)
+			if err != nil {
+				parseErrors = append(parseErrors, err)
+				continue
+			}
+			claims = append(claims, claim)
 		}
 	}
 
@@ -113,6 +126,26 @@ func (c *AuthorityCompiler) Normalize(ctx context.Context, source AuthoritySourc
 			Message: fmt.Sprintf("failed to parse %d claims", len(parseErrors)),
 			Err:     parseErrors[0],
 		}
+	}
+
+	if err := validateRelationships(claims); err != nil {
+		return AuthorityArtifact{}, &CompilationError{
+			Stage:   "normalization",
+			Message: "invalid claim relationship",
+			Err:     err,
+		}
+	}
+
+	sourceSnapshot, err := cloneAuthoritySource(source)
+	if err != nil {
+		return AuthorityArtifact{}, &CompilationError{
+			Stage:   "normalization",
+			Message: "source is not canonically serializable",
+			Err:     err,
+		}
+	}
+	if err := c.registerSource(sourceSnapshot); err != nil {
+		return AuthorityArtifact{}, err
 	}
 
 	graph := c.buildGraph(claims)
@@ -139,10 +172,37 @@ func (c *AuthorityCompiler) parseClaim(claimDict map[string]interface{}, sourceI
 		return Claim{}, newValidationError("type", fmt.Sprintf("invalid claim type: %s", claimType), nil)
 	}
 
-	scopeData, _ := claimDict["scope"].(map[string]interface{})
+	var scopeData map[string]interface{}
+	if rawScope, exists := claimDict["scope"]; exists {
+		var ok bool
+		scopeData, ok = rawScope.(map[string]interface{})
+		if !ok {
+			return Claim{}, newValidationError("scope", "claim scope must be an object", nil)
+		}
+	}
 	scope, err := parseScope(scopeData)
 	if err != nil {
 		return Claim{}, err
+	}
+
+	var conditions map[string]interface{}
+	if rawConditions, exists := claimDict["conditions"]; exists {
+		conditionMap, ok := rawConditions.(map[string]interface{})
+		if !ok {
+			return Claim{}, newValidationError("conditions", "claim conditions must be an object", nil)
+		}
+		conditions, err = cloneConditions(conditionMap)
+		if err != nil {
+			return Claim{}, newValidationError("conditions", "claim conditions must be canonically serializable", err)
+		}
+		for _, relation := range []string{"delegates_to", "revokes", "supersedes"} {
+			if value, exists := conditions[relation]; exists {
+				target, ok := value.(string)
+				if !ok || strings.TrimSpace(target) == "" {
+					return Claim{}, newValidationError("conditions."+relation, "relationship target must be a non-empty claim ID", nil)
+				}
+			}
+		}
 	}
 
 	subject, _ := claimDict["subject"].(string)
@@ -165,7 +225,7 @@ func (c *AuthorityCompiler) parseClaim(claimDict map[string]interface{}, sourceI
 		Action:     action,
 		Resource:   resource,
 		Scope:      scope,
-		Conditions: convertMapInterface(claimDict["conditions"]),
+		Conditions: conditions,
 		SourceID:   sourceID,
 	}, nil
 }
@@ -242,8 +302,15 @@ func (c *AuthorityCompiler) ResolveConflicts(ctx context.Context, artifact Autho
 	}
 
 	// First, handle revocations and supersessions
-	artifact = c.applyRevocations(artifact)
-	artifact = c.applySupersessions(artifact)
+	var err error
+	artifact, err = c.applyRevocations(artifact)
+	if err != nil {
+		return AuthorityArtifact{}, err
+	}
+	artifact, err = c.applySupersessions(artifact)
+	if err != nil {
+		return AuthorityArtifact{}, err
+	}
 
 	// Then handle remaining conflicts via precedence
 	conflicts := c.findConflicts(artifact.Claims)
@@ -298,8 +365,6 @@ func (c *AuthorityCompiler) findConflicts(claims []Claim) [][]Claim {
 		grouped[key] = append(grouped[key], claim)
 	}
 
-	// Only conflicting if there are DIFFERENT claim types (permission vs prohibition)
-	// or multiple claims of the same type (which one wins?)
 	// Sort keys for deterministic iteration
 	keys := make([]string, 0, len(grouped))
 	for k := range grouped {
@@ -309,13 +374,28 @@ func (c *AuthorityCompiler) findConflicts(claims []Claim) [][]Claim {
 
 	for _, key := range keys {
 		group := grouped[key]
-		if len(group) > 1 {
-			types := make(map[ClaimType]bool)
-			for _, c := range group {
-				types[c.Type] = true
+		used := make([]bool, len(group))
+		for i := range group {
+			if used[i] {
+				continue
 			}
-			if len(types) > 1 || len(group) > 1 {
-				conflicts = append(conflicts, group)
+			coextensive := []Claim{group[i]}
+			used[i] = true
+			for j := i + 1; j < len(group); j++ {
+				if !used[j] && scopesEqual(group[i].Scope, group[j].Scope) && conditionsEqual(group[i].Conditions, group[j].Conditions) {
+					coextensive = append(coextensive, group[j])
+					used[j] = true
+				}
+			}
+
+			hasPermission := false
+			hasProhibition := false
+			for _, claim := range coextensive {
+				hasPermission = hasPermission || claim.Type == Permission
+				hasProhibition = hasProhibition || claim.Type == Prohibition
+			}
+			if hasPermission && hasProhibition {
+				conflicts = append(conflicts, coextensive)
 			}
 		}
 	}
@@ -384,42 +464,57 @@ func (c *AuthorityCompiler) applyPrecedence(claims []Claim, artifact AuthorityAr
 	return &claims[0], nil
 }
 
-func (c *AuthorityCompiler) applyRevocations(artifact AuthorityArtifact) AuthorityArtifact {
-	revokedIDs := make(map[string]bool)
-	for _, edge := range artifact.Graph.Edges {
-		if edge.EdgeType == Revokes {
-			revokedIDs[edge.ToID] = true
-		}
-	}
-
-	newClaims := []Claim{}
-	for _, claim := range artifact.Claims {
-		if !revokedIDs[claim.ID] {
-			newClaims = append(newClaims, claim)
-		}
-	}
-	artifact.Claims = newClaims
-
-	return artifact
+func (c *AuthorityCompiler) applyRevocations(artifact AuthorityArtifact) (AuthorityArtifact, error) {
+	return c.applyDestructiveRelationships(artifact, Revokes)
 }
 
-func (c *AuthorityCompiler) applySupersessions(artifact AuthorityArtifact) AuthorityArtifact {
-	supersededIDs := make(map[string]bool)
-	for _, edge := range artifact.Graph.Edges {
-		if edge.EdgeType == Supersedes {
-			supersededIDs[edge.ToID] = true
-		}
+func (c *AuthorityCompiler) applySupersessions(artifact AuthorityArtifact) (AuthorityArtifact, error) {
+	return c.applyDestructiveRelationships(artifact, Supersedes)
+}
+
+func (c *AuthorityCompiler) applyDestructiveRelationships(artifact AuthorityArtifact, edgeType EdgeType) (AuthorityArtifact, error) {
+	removedIDs := make(map[string]bool)
+	claimsByID := make(map[string]Claim, len(artifact.Claims))
+	for _, claim := range artifact.Claims {
+		claimsByID[claim.ID] = claim
 	}
 
-	newClaims := []Claim{}
+	for _, edge := range artifact.Graph.Edges {
+		if edge.EdgeType != edgeType {
+			continue
+		}
+		issuer, issuerExists := claimsByID[edge.FromID]
+		target, targetExists := claimsByID[edge.ToID]
+		if !issuerExists || !targetExists {
+			return AuthorityArtifact{}, newValidationError("graph.edges", fmt.Sprintf("%s relationship references an inactive claim", edgeType), ErrInvalidEdgeReference)
+		}
+		if !scopesEqual(issuer.Scope, target.Scope) {
+			return AuthorityArtifact{}, &ConflictError{
+				ClaimIDs: []string{issuer.ID, target.ID},
+				Message:  fmt.Sprintf("%s requires coextensive issuer and target scopes", edgeType),
+			}
+		}
+		winner, err := c.applyPrecedence([]Claim{issuer, target}, artifact)
+		if err != nil {
+			return AuthorityArtifact{}, err
+		}
+		if winner == nil || winner.ID != issuer.ID {
+			return AuthorityArtifact{}, &ConflictError{
+				ClaimIDs: []string{issuer.ID, target.ID},
+				Message:  fmt.Sprintf("%s issuer does not outrank target", edgeType),
+			}
+		}
+		removedIDs[target.ID] = true
+	}
+
+	newClaims := make([]Claim, 0, len(artifact.Claims))
 	for _, claim := range artifact.Claims {
-		if !supersededIDs[claim.ID] {
+		if !removedIDs[claim.ID] {
 			newClaims = append(newClaims, claim)
 		}
 	}
 	artifact.Claims = newClaims
-
-	return artifact
+	return artifact, nil
 }
 
 // Compile generates executable enforcement artifacts.
@@ -435,39 +530,103 @@ func (c *AuthorityCompiler) Bind(artifact AuthorityArtifact) {
 
 // Returns deterministic JSON output sorted by keys.
 func (c *AuthorityCompiler) EmitProof(artifact AuthorityArtifact) string {
-	// Build claims list deterministically (sorted by ID)
+	proof, _ := c.emitProof(artifact)
+	return proof
+}
+
+func (c *AuthorityCompiler) emitProof(artifact AuthorityArtifact) (string, error) {
 	claimsList := make([]map[string]interface{}, 0, len(artifact.Claims))
 	sortedClaims := make([]Claim, len(artifact.Claims))
 	copy(sortedClaims, artifact.Claims)
 	sort.Slice(sortedClaims, func(i, j int) bool {
-		return sortedClaims[i].ID < sortedClaims[j].ID
+		if sortedClaims[i].ID != sortedClaims[j].ID {
+			return sortedClaims[i].ID < sortedClaims[j].ID
+		}
+		return sortedClaims[i].SourceID < sortedClaims[j].SourceID
 	})
 
 	for _, claim := range sortedClaims {
-		claimsList = append(claimsList, map[string]interface{}{
-			"action":    claim.Action,
-			"id":        claim.ID,
-			"resource":  claim.Resource,
-			"source_id": claim.SourceID,
-			"subject":   claim.Subject,
-			"type":      string(claim.Type),
+		claimsList = append(claimsList, canonicalClaimMap(claim))
+	}
+
+	nodeIDs := make([]string, 0, len(artifact.Graph.Nodes))
+	for id := range artifact.Graph.Nodes {
+		nodeIDs = append(nodeIDs, id)
+	}
+	sort.Strings(nodeIDs)
+	nodes := make([]map[string]interface{}, 0, len(nodeIDs))
+	for _, id := range nodeIDs {
+		nodes = append(nodes, map[string]interface{}{
+			"key":   id,
+			"claim": canonicalClaimMap(artifact.Graph.Nodes[id]),
 		})
 	}
 
-	proofData := map[string]interface{}{
-		"artifact_id":  artifact.ID,
-		"claims":       claimsList,
-		"claims_count": len(artifact.Claims),
-		"generated_at": artifact.GeneratedAt.Format(time.RFC3339),
-		"graph": map[string]interface{}{
-			"edges": len(artifact.Graph.Edges),
-			"nodes": len(artifact.Graph.Nodes),
-		},
-		"source_id": artifact.SourceID,
+	edges := append([]Edge(nil), artifact.Graph.Edges...)
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].FromID != edges[j].FromID {
+			return edges[i].FromID < edges[j].FromID
+		}
+		if edges[i].ToID != edges[j].ToID {
+			return edges[i].ToID < edges[j].ToID
+		}
+		return edges[i].EdgeType < edges[j].EdgeType
+	})
+	edgeList := make([]map[string]interface{}, 0, len(edges))
+	for _, edge := range edges {
+		edgeList = append(edgeList, map[string]interface{}{
+			"from_id": edge.FromID,
+			"to_id":   edge.ToID,
+			"type":    string(edge.EdgeType),
+		})
 	}
 
-	jsonBytes, _ := json.MarshalIndent(proofData, "", "  ")
-	return string(jsonBytes)
+	sourceIDs := map[string]bool{artifact.SourceID: true}
+	for _, claim := range artifact.Claims {
+		sourceIDs[claim.SourceID] = true
+	}
+	for _, claim := range artifact.Graph.Nodes {
+		sourceIDs[claim.SourceID] = true
+	}
+	delete(sourceIDs, "")
+	sortedSourceIDs := make([]string, 0, len(sourceIDs))
+	for id := range sourceIDs {
+		sortedSourceIDs = append(sortedSourceIDs, id)
+	}
+	sort.Strings(sortedSourceIDs)
+
+	c.mu.RLock()
+	sources := make([]map[string]interface{}, 0, len(sortedSourceIDs))
+	for _, id := range sortedSourceIDs {
+		source, exists := c.sources[id]
+		if !exists {
+			c.mu.RUnlock()
+			return "", newValidationError("source_id", fmt.Sprintf("unknown source in proof: %s", id), nil)
+		}
+		sources = append(sources, map[string]interface{}{
+			"id":      source.ID,
+			"type":    string(source.Type),
+			"version": source.Version,
+		})
+	}
+	c.mu.RUnlock()
+
+	proofData := map[string]interface{}{
+		"claims":       claimsList,
+		"claims_count": len(artifact.Claims),
+		"graph": map[string]interface{}{
+			"edges": edgeList,
+			"nodes": nodes,
+		},
+		"source_id": artifact.SourceID,
+		"sources":   sources,
+	}
+
+	jsonBytes, err := json.MarshalIndent(proofData, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("serialize authority proof: %w", err)
+	}
+	return string(jsonBytes), nil
 }
 
 // Process runs the full compilation pipeline.
@@ -478,11 +637,12 @@ func (c *AuthorityCompiler) Process(source AuthoritySource) interface{} {
 
 // ProcessWithContext runs the full compilation pipeline with context support.
 func (c *AuthorityCompiler) ProcessWithContext(ctx context.Context, source AuthoritySource) interface{} {
-	c.logger.Info("Starting compilation for source %s", source.ID)
+	logger := c.getLogger()
+	logger.Info("Starting compilation for source %s", source.ID)
 
 	artifact, err := c.Normalize(ctx, source)
 	if err != nil {
-		c.logger.Error("Normalization failed: %v", err)
+		logger.Error("Normalization failed: %v", err)
 		return CompilationFailure{
 			FailureStage:      "normalization",
 			ViolatedInvariant: err.Error(),
@@ -490,10 +650,10 @@ func (c *AuthorityCompiler) ProcessWithContext(ctx context.Context, source Autho
 			FailClosed:        true,
 		}
 	}
-	c.logger.Info("Normalized %d claims", len(artifact.Claims))
+	logger.Info("Normalized %d claims", len(artifact.Claims))
 
 	if err := c.Validate(artifact); err != nil {
-		c.logger.Error("Validation failed: %v", err)
+		logger.Error("Validation failed: %v", err)
 		return CompilationFailure{
 			FailureStage:      "validation",
 			ViolatedInvariant: err.Error(),
@@ -501,11 +661,11 @@ func (c *AuthorityCompiler) ProcessWithContext(ctx context.Context, source Autho
 			FailClosed:        true,
 		}
 	}
-	c.logger.Info("Validation passed")
+	logger.Info("Validation passed")
 
 	artifact, err = c.ResolveConflicts(ctx, artifact)
 	if err != nil {
-		c.logger.Error("Conflict resolution failed: %v", err)
+		logger.Error("Conflict resolution failed: %v", err)
 		return CompilationFailure{
 			FailureStage:      "resolution",
 			ViolatedInvariant: err.Error(),
@@ -513,13 +673,22 @@ func (c *AuthorityCompiler) ProcessWithContext(ctx context.Context, source Autho
 			FailClosed:        true,
 		}
 	}
-	c.logger.Info("Conflict resolution complete, %d claims remaining", len(artifact.Claims))
+	logger.Info("Conflict resolution complete, %d claims remaining", len(artifact.Claims))
 
 	artifact = c.Compile(artifact)
+	proof, err := c.emitProof(artifact)
+	if err != nil {
+		logger.Error("Proof serialization failed: %v", err)
+		return CompilationFailure{
+			FailureStage:      "compilation",
+			ViolatedInvariant: err.Error(),
+			InvolvedClaimIDs:  getClaimIDs(artifact.Claims),
+			FailClosed:        true,
+		}
+	}
 	c.Bind(artifact)
-	proof := c.EmitProof(artifact)
 
-	c.logger.Info("Compilation successful for artifact %s", artifact.ID)
+	logger.Info("Compilation successful for artifact %s", artifact.ID)
 	return CompilationSuccess{
 		Artifact: artifact,
 		Proof:    proof,
@@ -596,24 +765,36 @@ func parseStringSlice(value interface{}, field string) ([]string, error) {
 	if value == nil {
 		return []string{}, nil
 	}
+	var raw []string
 	switch values := value.(type) {
 	case []string:
-		result := make([]string, len(values))
-		copy(result, values)
-		return result, nil
+		raw = append(raw, values...)
 	case []interface{}:
-		result := make([]string, 0, len(values))
+		raw = make([]string, 0, len(values))
 		for _, item := range values {
 			s, ok := item.(string)
 			if !ok {
 				return nil, newValidationError(field, "must contain only strings", nil)
 			}
-			result = append(result, s)
+			raw = append(raw, s)
 		}
-		return result, nil
 	default:
 		return nil, newValidationError(field, "must be a string slice", nil)
 	}
+
+	seen := make(map[string]bool, len(raw))
+	result := make([]string, 0, len(raw))
+	for _, value := range raw {
+		if strings.TrimSpace(value) == "" {
+			return nil, newValidationError(field, "must not contain empty strings", nil)
+		}
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 func parseTimeField(value interface{}, field string) (*time.Time, error) {
@@ -628,17 +809,177 @@ func parseTimeField(value interface{}, field string) (*time.Time, error) {
 	if err != nil {
 		return nil, newValidationError(field, "must be an RFC3339 timestamp string", err)
 	}
+	parsed = parsed.UTC()
 	return &parsed, nil
 }
 
-func convertMapInterface(m interface{}) map[string]interface{} {
-	if m == nil {
+func cloneConditions(conditions map[string]interface{}) (map[string]interface{}, error) {
+	cloned, ok := cloneRuntimeConditions(conditions)
+	if !ok {
+		return nil, fmt.Errorf("unsupported condition value")
+	}
+	if _, err := json.Marshal(cloned); err != nil {
+		return nil, err
+	}
+	return cloned, nil
+}
+
+func cloneAuthoritySource(source AuthoritySource) (AuthoritySource, error) {
+	encoded, err := json.Marshal(source)
+	if err != nil {
+		return AuthoritySource{}, err
+	}
+	var cloned AuthoritySource
+	if err := json.Unmarshal(encoded, &cloned); err != nil {
+		return AuthoritySource{}, err
+	}
+	return cloned, nil
+}
+
+func (c *AuthorityCompiler) registerSource(source AuthoritySource) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if existing, exists := c.sources[source.ID]; exists {
+		existingBytes, err := json.Marshal(existing)
+		if err != nil {
+			return fmt.Errorf("serialize existing authority source: %w", err)
+		}
+		newBytes, err := json.Marshal(source)
+		if err != nil {
+			return fmt.Errorf("serialize authority source: %w", err)
+		}
+		if !bytes.Equal(existingBytes, newBytes) {
+			return newValidationError("source.id", fmt.Sprintf("conflicting redefinition of authority source %s", source.ID), nil)
+		}
 		return nil
 	}
-	if mm, ok := m.(map[string]interface{}); ok {
-		return mm
+	c.sources[source.ID] = source
+	return nil
+}
+
+func validateRelationships(claims []Claim) error {
+	claimsByID := make(map[string]Claim, len(claims))
+	for _, claim := range claims {
+		if _, exists := claimsByID[claim.ID]; exists {
+			return newValidationError("claim.id", fmt.Sprintf("duplicate claim ID: %s", claim.ID), ErrInvalidClaim)
+		}
+		claimsByID[claim.ID] = claim
+	}
+
+	for _, issuer := range claims {
+		for _, relationship := range []struct {
+			key      string
+			edgeType EdgeType
+		}{
+			{key: "delegates_to", edgeType: Delegates},
+			{key: "revokes", edgeType: Revokes},
+			{key: "supersedes", edgeType: Supersedes},
+		} {
+			rawTarget, exists := issuer.Conditions[relationship.key]
+			if !exists {
+				continue
+			}
+			targetID, ok := rawTarget.(string)
+			if !ok || strings.TrimSpace(targetID) == "" {
+				return newValidationError("conditions."+relationship.key, "relationship target must be a non-empty claim ID", nil)
+			}
+			target, exists := claimsByID[targetID]
+			if !exists {
+				return newValidationError("conditions."+relationship.key, fmt.Sprintf("relationship target does not exist: %s", targetID), ErrInvalidEdgeReference)
+			}
+			if relationship.edgeType == Delegates {
+				if issuer.Action != "delegate" {
+					return newValidationError("claim.action", fmt.Sprintf("delegation issuer %s must use action delegate", issuer.ID), ErrInvalidClaim)
+				}
+				if target.Type != Delegation {
+					return newValidationError("conditions.delegates_to", fmt.Sprintf("delegation target %s must be a delegation claim", target.ID), ErrInvalidClaim)
+				}
+			}
+		}
 	}
 	return nil
+}
+
+func scopesEqual(a, b Scope) bool {
+	if !stringSetsEqual(a.Jurisdictions, b.Jurisdictions) || !stringSetsEqual(a.Operations, b.Operations) {
+		return false
+	}
+	return timesEqual(a.TimeStart, b.TimeStart) && timesEqual(a.TimeEnd, b.TimeEnd)
+}
+
+func stringSetsEqual(a, b []string) bool {
+	aSet := make(map[string]bool, len(a))
+	bSet := make(map[string]bool, len(b))
+	for _, value := range a {
+		aSet[value] = true
+	}
+	for _, value := range b {
+		bSet[value] = true
+	}
+	if len(aSet) != len(bSet) {
+		return false
+	}
+	for value := range aSet {
+		if !bSet[value] {
+			return false
+		}
+	}
+	return true
+}
+
+func timesEqual(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
+}
+
+func conditionsEqual(a, b map[string]interface{}) bool {
+	if len(a) == 0 && len(b) == 0 {
+		return true
+	}
+	aBytes, aErr := json.Marshal(a)
+	bBytes, bErr := json.Marshal(b)
+	return aErr == nil && bErr == nil && bytes.Equal(aBytes, bBytes)
+}
+
+func canonicalClaimMap(claim Claim) map[string]interface{} {
+	return map[string]interface{}{
+		"action":     claim.Action,
+		"conditions": claim.Conditions,
+		"id":         claim.ID,
+		"resource":   claim.Resource,
+		"scope": map[string]interface{}{
+			"jurisdictions": canonicalStringSet(claim.Scope.Jurisdictions),
+			"operations":    canonicalStringSet(claim.Scope.Operations),
+			"time_end":      canonicalProofTime(claim.Scope.TimeEnd),
+			"time_start":    canonicalProofTime(claim.Scope.TimeStart),
+		},
+		"source_id": claim.SourceID,
+		"subject":   claim.Subject,
+		"type":      string(claim.Type),
+	}
+}
+
+func canonicalStringSet(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if !seen[value] {
+			seen[value] = true
+			result = append(result, value)
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func canonicalProofTime(value *time.Time) interface{} {
+	if value == nil {
+		return nil
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func generateUUID() string {
@@ -650,13 +991,11 @@ func precedenceKey(source AuthoritySource, claim Claim, authorityOrder map[Autho
 	version := parseVersion(source.Version)
 	versionKey := []int{-version[0], -version[1], -version[2]}
 	depth := getDelegationDepth(claim, graph)
-	specificity := getScopeSpecificity(claim.Scope)
 
 	return []interface{}{
 		order,
 		versionKey,
 		depth,
-		-specificity,
 	}
 }
 
@@ -762,18 +1101,4 @@ func getDelegationDepth(claim Claim, graph AuthorityGraph) int {
 	}
 
 	return depth
-}
-
-func getScopeSpecificity(scope Scope) int {
-	specificity := 0
-	specificity += len(scope.Jurisdictions)
-	specificity += len(scope.Operations)
-	// Time bounds make it more specific
-	if scope.TimeStart != nil {
-		specificity += 10
-	}
-	if scope.TimeEnd != nil {
-		specificity += 10
-	}
-	return specificity
 }
