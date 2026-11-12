@@ -296,6 +296,104 @@ func TestScopedConflictsRemainApplicableAtRuntime(t *testing.T) {
 	}
 }
 
+func TestRuntimeProhibitionWithUnknownFactsFailsClosed(t *testing.T) {
+	allow := core.Claim{
+		ID: "allow", Type: core.Permission, Subject: "user", Action: "read",
+		Resource: "/data", SourceID: "source",
+	}
+	denyUS := core.Claim{
+		ID: "deny-us", Type: core.Prohibition, Subject: "user", Action: "read",
+		Resource: "/data", SourceID: "source",
+		Scope: core.Scope{Jurisdictions: []string{"US"}},
+	}
+	denyClassified := core.Claim{
+		ID: "deny-classified", Type: core.Prohibition, Subject: "user", Action: "read",
+		Resource: "/data", SourceID: "source",
+		Conditions: map[string]interface{}{"classified": true},
+	}
+
+	jurisdictional := core.NewRuntimeInterface(validArtifact(allow, denyUS))
+	unknown := jurisdictional.IsAuthorized("user", "read", "/data")
+	if unknown["allowed"].(bool) {
+		t.Fatal("a query that omits the jurisdiction must not bypass a jurisdiction-scoped prohibition")
+	}
+	if unknown["authority_id"].(string) != "deny-us" {
+		t.Fatalf("expected the prohibition to be the deciding authority, got %v", unknown["authority_id"])
+	}
+	if jurisdictional.IsAuthorizedWithContext("user", "read", "/data", core.AuthorizationContext{Jurisdiction: "US"})["allowed"].(bool) {
+		t.Fatal("US prohibition must deny")
+	}
+	if !jurisdictional.IsAuthorizedWithContext("user", "read", "/data", core.AuthorizationContext{Jurisdiction: "EU"})["allowed"].(bool) {
+		t.Fatal("a jurisdiction outside the prohibition must remain permitted")
+	}
+
+	conditional := core.NewRuntimeInterface(validArtifact(allow, denyClassified))
+	if conditional.IsAuthorized("user", "read", "/data")["allowed"].(bool) {
+		t.Fatal("a query that omits the condition fact must not bypass a conditional prohibition")
+	}
+	classified := core.AuthorizationContext{Attributes: map[string]interface{}{"classified": true}}
+	if conditional.IsAuthorizedWithContext("user", "read", "/data", classified)["allowed"].(bool) {
+		t.Fatal("matching condition must deny")
+	}
+	unclassified := core.AuthorizationContext{Attributes: map[string]interface{}{"classified": false}}
+	if !conditional.IsAuthorizedWithContext("user", "read", "/data", unclassified)["allowed"].(bool) {
+		t.Fatal("a condition fact that excludes the prohibition must remain permitted")
+	}
+}
+
+func TestRevokedDelegatorCannotLeaveOrphanDelegationInSuccess(t *testing.T) {
+	parent := map[string]interface{}{
+		"id": "parent", "type": "permission", "subject": "admin",
+		"action": "delegate", "resource": "/data",
+		"scope":      map[string]interface{}{},
+		"conditions": map[string]interface{}{"delegates_to": "child"},
+	}
+	child := map[string]interface{}{
+		"id": "child", "type": "delegation", "subject": "service",
+		"action": "read", "resource": "/data",
+		"scope": map[string]interface{}{},
+	}
+	revoker := map[string]interface{}{
+		"id": "revoker", "type": "prohibition", "subject": "admin",
+		"action": "delegate", "resource": "/data",
+		"scope":      map[string]interface{}{},
+		"conditions": map[string]interface{}{"revokes": "parent"},
+	}
+
+	result := core.NewAuthorityCompiler().Process(
+		sourceWithClaims("source", []interface{}{parent, child, revoker}),
+	)
+	if success, ok := result.(core.CompilationSuccess); ok {
+		if err := core.ValidateAirWithErrors(success.Artifact); err != nil {
+			t.Fatalf("compilation reported success for an artifact that fails validation: %v", err)
+		}
+	}
+	requireCompilationFailure(t, result)
+}
+
+func TestResolutionFailureReportsInvolvedClaims(t *testing.T) {
+	allow := baseClaim()
+	allow["conditions"] = map[string]interface{}{"revokes": "deny"}
+	deny := baseClaim()
+	deny["id"] = "deny"
+	deny["type"] = "prohibition"
+
+	result := core.NewAuthorityCompiler().Process(
+		sourceWithClaims("source", []interface{}{allow, deny}),
+	)
+	failure, ok := result.(core.CompilationFailure)
+	if !ok {
+		t.Fatalf("expected fail-closed CompilationFailure, got %T", result)
+	}
+	if failure.FailureStage != "resolution" {
+		t.Fatalf("expected a resolution failure, got stage %q", failure.FailureStage)
+	}
+	if len(failure.InvolvedClaimIDs) != 2 ||
+		failure.InvolvedClaimIDs[0] != "allow" || failure.InvolvedClaimIDs[1] != "deny" {
+		t.Fatalf("resolution failure must report the involved claim IDs, got %v", failure.InvolvedClaimIDs)
+	}
+}
+
 func TestProofIsDeterministicAndCommitsPolicySemantics(t *testing.T) {
 	source := sourceWithClaims("source", []interface{}{baseClaim()})
 	first := core.NewAuthorityCompiler().Process(source).(core.CompilationSuccess)

@@ -663,9 +663,26 @@ func (c *AuthorityCompiler) ProcessWithContext(ctx context.Context, source Autho
 	}
 	logger.Info("Validation passed")
 
-	artifact, err = c.ResolveConflicts(ctx, artifact)
+	// Keep the validated artifact until resolution succeeds: a failed
+	// resolution returns an empty artifact, which would report no claim IDs.
+	resolved, err := c.ResolveConflicts(ctx, artifact)
 	if err != nil {
 		logger.Error("Conflict resolution failed: %v", err)
+		return CompilationFailure{
+			FailureStage:      "resolution",
+			ViolatedInvariant: err.Error(),
+			InvolvedClaimIDs:  getClaimIDs(artifact.Claims),
+			FailClosed:        true,
+		}
+	}
+	artifact = resolved
+
+	// Resolution removes claims. The survivors must still form a valid
+	// artifact (a revoked delegator must not leave its delegation behind
+	// without a parent); otherwise success would publish authority that
+	// validation rejects.
+	if err := c.Validate(artifact); err != nil {
+		logger.Error("Resolved artifact failed validation: %v", err)
 		return CompilationFailure{
 			FailureStage:      "resolution",
 			ViolatedInvariant: err.Error(),

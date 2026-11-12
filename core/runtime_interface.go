@@ -66,7 +66,8 @@ func (ri *RuntimeInterface) IsAuthorizedWithContext(subject, action, resource st
 		return ri.deniedResult("Invalid authorization query - failing closed")
 	}
 
-	applicable := ri.applicableClaims(subject, action, resource, normalizeAuthorizationContext(ctx))
+	ctx = normalizeAuthorizationContext(ctx)
+	applicable := ri.applicableClaims(subject, action, resource, ctx)
 
 	// Check for prohibitions first (highest priority).
 	for _, claim := range applicable {
@@ -75,6 +76,20 @@ func (ri *RuntimeInterface) IsAuthorizedWithContext(subject, action, resource st
 				"allowed":      false,
 				"authority_id": claim.ID,
 				"reason":       "Prohibited by authority",
+				"scope":        ri.scopeToDict(claim.Scope),
+			}
+		}
+	}
+
+	// A prohibition whose jurisdiction or condition facts are absent from the
+	// context cannot be ruled out. Skipping it would let an applicable
+	// permission authorize the action, so it denies.
+	for _, claim := range ri.artifact.Claims {
+		if claim.Type == Prohibition && ri.claimMayApply(claim, subject, action, resource, ctx, true) {
+			return map[string]interface{}{
+				"allowed":      false,
+				"authority_id": claim.ID,
+				"reason":       "Prohibition cannot be ruled out without its jurisdiction or condition facts - failing closed",
 				"scope":        ri.scopeToDict(claim.Scope),
 			}
 		}
@@ -170,6 +185,14 @@ func (ri *RuntimeInterface) applicableClaims(subject, action, resource string, c
 }
 
 func (ri *RuntimeInterface) claimApplies(claim Claim, subject, action, resource string, ctx AuthorizationContext) bool {
+	return ri.claimMayApply(claim, subject, action, resource, ctx, false)
+}
+
+// claimMayApply reports whether a claim applies to the query. A jurisdiction
+// or condition fact that the context does not supply excludes the claim unless
+// unknownFactsApply is set, in which case only a supplied fact that
+// contradicts the claim excludes it.
+func (ri *RuntimeInterface) claimMayApply(claim Claim, subject, action, resource string, ctx AuthorizationContext, unknownFactsApply bool) bool {
 	if !ri.matches(claim.Subject, subject) ||
 		!ri.matches(claim.Action, action) ||
 		!ri.matches(claim.Resource, resource) {
@@ -186,7 +209,11 @@ func (ri *RuntimeInterface) claimApplies(claim Claim, subject, action, resource 
 		return false
 	}
 	if len(claim.Scope.Jurisdictions) > 0 {
-		if ctx.Jurisdiction == "" || !containsRuntimeString(claim.Scope.Jurisdictions, ctx.Jurisdiction) {
+		if ctx.Jurisdiction == "" {
+			if !unknownFactsApply {
+				return false
+			}
+		} else if !containsRuntimeString(claim.Scope.Jurisdictions, ctx.Jurisdiction) {
 			return false
 		}
 	}
@@ -196,7 +223,13 @@ func (ri *RuntimeInterface) claimApplies(claim Claim, subject, action, resource 
 			continue
 		}
 		actual, exists := ctx.Attributes[key]
-		if !exists || !reflect.DeepEqual(expected, actual) {
+		if !exists {
+			if !unknownFactsApply {
+				return false
+			}
+			continue
+		}
+		if !reflect.DeepEqual(expected, actual) {
 			return false
 		}
 	}
