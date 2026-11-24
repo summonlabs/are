@@ -341,6 +341,60 @@ func TestRuntimeProhibitionWithUnknownFactsFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRuntimeConditionFactsCompareByValue(t *testing.T) {
+	allow := core.Claim{
+		ID: "allow", Type: core.Permission, Subject: "user", Action: "read",
+		Resource: "/data", SourceID: "source",
+	}
+	// A policy decoded from JSON holds float64(3). A Go caller supplies int 3.
+	denyLevel := core.Claim{
+		ID: "deny-level", Type: core.Prohibition, Subject: "user", Action: "read",
+		Resource: "/data", SourceID: "source",
+		Conditions: map[string]interface{}{"clearance": float64(3)},
+	}
+	runtime := core.NewRuntimeInterface(validArtifact(allow, denyLevel))
+
+	same := core.AuthorizationContext{Attributes: map[string]interface{}{"clearance": 3}}
+	if runtime.IsAuthorizedWithContext("user", "read", "/data", same)["allowed"].(bool) {
+		t.Fatal("the same number in another Go type must not bypass a conditional prohibition")
+	}
+	other := core.AuthorizationContext{Attributes: map[string]interface{}{"clearance": 4}}
+	if !runtime.IsAuthorizedWithContext("user", "read", "/data", other)["allowed"].(bool) {
+		t.Fatal("a different condition value must still exclude the prohibition")
+	}
+	text := core.AuthorizationContext{Attributes: map[string]interface{}{"clearance": "3"}}
+	if !runtime.IsAuthorizedWithContext("user", "read", "/data", text)["allowed"].(bool) {
+		t.Fatal("a string is not the number it spells")
+	}
+}
+
+func TestEqualAuthorityCannotRevokeOrSupersedeByClaimID(t *testing.T) {
+	for _, relationship := range []string{"revokes", "supersedes"} {
+		for _, ids := range [][2]string{{"a-issuer", "z-target"}, {"z-issuer", "a-target"}} {
+			issuerID, targetID := ids[0], ids[1]
+			t.Run(relationship+"/"+issuerID, func(t *testing.T) {
+				// Both prohibitions come from the same source, so neither
+				// outranks the other. Which ID sorts first must not decide
+				// whether a prohibition is removed.
+				issuer := map[string]interface{}{
+					"id": issuerID, "type": "prohibition", "subject": "user",
+					"action": "write", "resource": "/data",
+					"scope":      map[string]interface{}{},
+					"conditions": map[string]interface{}{relationship: targetID},
+				}
+				target := map[string]interface{}{
+					"id": targetID, "type": "prohibition", "subject": "user",
+					"action": "read", "resource": "/data",
+					"scope": map[string]interface{}{},
+				}
+				requireCompilationFailure(t, core.NewAuthorityCompiler().Process(
+					sourceWithClaims("source", []interface{}{issuer, target}),
+				))
+			})
+		}
+	}
+}
+
 func TestRevokedDelegatorCannotLeaveOrphanDelegationInSuccess(t *testing.T) {
 	parent := map[string]interface{}{
 		"id": "parent", "type": "permission", "subject": "admin",

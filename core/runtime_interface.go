@@ -1,6 +1,8 @@
 package core
 
 import (
+	"bytes"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"sync"
@@ -229,12 +231,26 @@ func (ri *RuntimeInterface) claimMayApply(claim Claim, subject, action, resource
 			}
 			continue
 		}
-		if !reflect.DeepEqual(expected, actual) {
+		if !runtimeFactsEqual(expected, actual) {
 			return false
 		}
 	}
 
 	return true
+}
+
+// runtimeFactsEqual compares a condition value with a supplied fact by value.
+// A policy decoded from JSON holds float64 numbers while callers supply Go
+// integers; the same value in another representation must not make a
+// prohibition inapplicable. Canonical JSON is the comparison the compiler uses
+// for conditions.
+func runtimeFactsEqual(expected, actual interface{}) bool {
+	if reflect.DeepEqual(expected, actual) {
+		return true
+	}
+	expectedJSON, expectedErr := json.Marshal(expected)
+	actualJSON, actualErr := json.Marshal(actual)
+	return expectedErr == nil && actualErr == nil && bytes.Equal(expectedJSON, actualJSON)
 }
 
 func (ri *RuntimeInterface) matches(pattern, value string) bool {

@@ -504,6 +504,15 @@ func (c *AuthorityCompiler) applyDestructiveRelationships(artifact AuthorityArti
 				Message:  fmt.Sprintf("%s issuer does not outrank target", edgeType),
 			}
 		}
+		// Claims that tie on every precedence criterion are unresolvable. Only a
+		// prohibition prevails over an equally ranked claim of another type; the
+		// claim ID must not decide whether authority is removed.
+		if c.samePrecedence(issuer, target, artifact.Graph) && !(issuer.Type == Prohibition && target.Type != Prohibition) {
+			return AuthorityArtifact{}, &ConflictError{
+				ClaimIDs: []string{issuer.ID, target.ID},
+				Message:  fmt.Sprintf("%s issuer does not outrank target", edgeType),
+			}
+		}
 		removedIDs[target.ID] = true
 	}
 
@@ -515,6 +524,20 @@ func (c *AuthorityCompiler) applyDestructiveRelationships(artifact AuthorityArti
 	}
 	artifact.Claims = newClaims
 	return artifact, nil
+}
+
+// samePrecedence reports whether two claims tie on source type, version and
+// delegation depth. Both sources must already be registered.
+func (c *AuthorityCompiler) samePrecedence(a, b Claim, graph AuthorityGraph) bool {
+	c.mu.RLock()
+	sourceA, sourceB := c.sources[a.SourceID], c.sources[b.SourceID]
+	c.mu.RUnlock()
+
+	authorityOrder := AuthorityTypeOrder()
+	return comparePrecedenceKeys(
+		precedenceKey(sourceA, a, authorityOrder, graph),
+		precedenceKey(sourceB, b, authorityOrder, graph),
+	) == 0
 }
 
 // Compile generates executable enforcement artifacts.
